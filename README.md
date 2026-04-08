@@ -1,4 +1,5 @@
-# constmap
+# constmap 
+[![CI](https://github.com/lemire/rsconstmap/actions/workflows/ci.yml/badge.svg)](https://github.com/lemire/rsconstmap/actions/workflows/ci.yml)
 
 A static map from strings to `u64` values using binary fuse filter construction. It can be several times smaller and faster than the equivalent HashMap.
 
