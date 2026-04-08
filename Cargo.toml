@@ -1,0 +1,18 @@
+[package]
+name = "constmap"
+version = "0.1.0"
+edition = "2021"
+description = "A static map from strings to u64 values using binary fuse filter construction"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+xxhash-rust = { version = "0.8", features = ["xxh64"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+tempfile = "3"
+
+[[bench]]
+name = "constmap_bench"
+harness = false
