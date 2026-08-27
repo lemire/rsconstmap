@@ -5,11 +5,24 @@
 //!
 //! Lookup is extremely fast: one xxhash call plus three array accesses and two XORs.
 //! The data structure is immutable after construction.
+//!
+//! Two map types are provided: [`ConstMap`], which returns an undefined value for a
+//! key that was not in the original set, and [`VerifiedConstMap`], which stores a
+//! fingerprint per key and returns [`NOT_FOUND`] instead, for twice the memory.
+//!
+//! Both support batched lookups (`map_many` / `map_many_into`), which overlap the
+//! memory accesses of several keys and are faster than a loop over `map`, and both
+//! serialize to a checksummed binary format (`write_to` / `read_from`,
+//! `save_to_file` / `load_from_file`).
 
 use std::collections::HashMap;
-use std::io::{self, Read, Write};
 
 use xxhash_rust::xxh64::xxh64;
+
+mod mapmany;
+#[cfg(test)]
+mod report;
+mod serialize;
 
 /// Sentinel value returned by [`VerifiedConstMap::map`] when the key was not
 /// in the original set.
@@ -28,7 +41,7 @@ fn murmur64(mut h: u64) -> u64 {
 }
 
 #[inline]
-fn mixsplit(key: u64, seed: u64) -> u64 {
+pub(crate) fn mixsplit(key: u64, seed: u64) -> u64 {
     murmur64(key.wrapping_add(seed))
 }
 
@@ -42,7 +55,7 @@ fn splitmix64(seed: &mut u64) -> u64 {
 }
 
 #[inline]
-fn fingerprint(hash: u64) -> u64 {
+pub(crate) fn fingerprint(hash: u64) -> u64 {
     hash ^ (hash >> 32)
 }
 
@@ -63,42 +76,23 @@ fn calculate_size_factor(size: u32) -> f64 {
     )
 }
 
-// ---------- FNV-1a 64-bit ----------
-
-struct Fnv64a(u64);
-
-impl Fnv64a {
-    fn new() -> Self {
-        Fnv64a(0xcbf29ce484222325)
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.0 ^= b as u64;
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-    fn finish(&self) -> u64 {
-        self.0
-    }
-}
-
 // ---------- ConstMap ----------
 
 /// An immutable map from strings to `u64` values.
 ///
 /// Lookup of keys not in the original set returns an undefined value.
 pub struct ConstMap {
-    seed: u64,
-    segment_length: u32,
-    segment_length_mask: u32,
-    segment_count: u32,
-    segment_count_length: u32,
-    data: Vec<u64>,
+    pub(crate) seed: u64,
+    pub(crate) segment_length: u32,
+    pub(crate) segment_length_mask: u32,
+    pub(crate) segment_count: u32,
+    pub(crate) segment_count_length: u32,
+    pub(crate) data: Vec<u64>,
 }
 
 impl ConstMap {
     #[inline]
-    fn get_hash_from_hash(&self, hash: u64) -> (u32, u32, u32) {
+    pub(crate) fn get_hash_from_hash(&self, hash: u64) -> (u32, u32, u32) {
         let hi = ((hash as u128 * self.segment_count_length as u128) >> 64) as u32;
         let h0 = hi;
         let mut h1 = h0.wrapping_add(self.segment_length);
@@ -378,136 +372,17 @@ impl ConstMap {
         let (h0, h1, h2) = self.get_hash_from_hash(hash);
         self.data[h0 as usize] ^ self.data[h1 as usize] ^ self.data[h2 as usize]
     }
+}
 
-    /// Serialize the `ConstMap` to a writer in a portable binary format.
-    ///
-    /// A FNV-1a checksum is appended for integrity verification.
-    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<u64> {
-        let mut hasher = Fnv64a::new();
 
-        // Magic.
-        let magic = b"CMAP0001";
-        w.write_all(magic)?;
-        hasher.write(magic);
-
-        // Seed.
-        let mut buf = self.seed.to_le_bytes();
-        w.write_all(&buf)?;
-        hasher.write(&buf);
-
-        // Segment length.
-        let sl = self.segment_length.to_le_bytes();
-        w.write_all(&sl)?;
-        hasher.write(&sl);
-
-        // Segment count.
-        let sc = self.segment_count.to_le_bytes();
-        w.write_all(&sc)?;
-        hasher.write(&sc);
-
-        // Data length.
-        let data_len = (self.data.len() as u32).to_le_bytes();
-        w.write_all(&data_len)?;
-        hasher.write(&data_len);
-
-        // Data.
-        for &v in &self.data {
-            buf = v.to_le_bytes();
-            w.write_all(&buf)?;
-            hasher.write(&buf);
-        }
-
-        // Checksum.
-        buf = hasher.finish().to_le_bytes();
-        w.write_all(&buf)?;
-
-        let written = 8 + 8 + 4 + 4 + 4 + 8 * self.data.len() as u64 + 8;
-        Ok(written)
-    }
-
-    /// Deserialize a `ConstMap` from a reader.
-    ///
-    /// Verifies the trailing checksum and returns an error if the data is corrupted.
-    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
-        let mut hasher = Fnv64a::new();
-        let mut buf8 = [0u8; 8];
-        let mut buf4 = [0u8; 4];
-
-        // Magic.
-        r.read_exact(&mut buf8)?;
-        hasher.write(&buf8);
-        if &buf8 != b"CMAP0001" {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "constmap: invalid magic bytes",
-            ));
-        }
-
-        // Seed.
-        r.read_exact(&mut buf8)?;
-        hasher.write(&buf8);
-        let seed = u64::from_le_bytes(buf8);
-
-        // Segment length.
-        r.read_exact(&mut buf4)?;
-        hasher.write(&buf4);
-        let segment_length = u32::from_le_bytes(buf4);
-        let segment_length_mask = segment_length.wrapping_sub(1);
-
-        // Segment count.
-        r.read_exact(&mut buf4)?;
-        hasher.write(&buf4);
-        let segment_count = u32::from_le_bytes(buf4);
-        let segment_count_length = segment_count * segment_length;
-
-        // Data length.
-        r.read_exact(&mut buf4)?;
-        hasher.write(&buf4);
-        let data_len = u32::from_le_bytes(buf4) as usize;
-
-        // Data.
-        let mut data = vec![0u64; data_len];
-        for slot in data.iter_mut() {
-            r.read_exact(&mut buf8)?;
-            hasher.write(&buf8);
-            *slot = u64::from_le_bytes(buf8);
-        }
-
-        // Checksum.
-        let expected_sum = hasher.finish();
-        r.read_exact(&mut buf8)?;
-        let got_sum = u64::from_le_bytes(buf8);
-        if got_sum != expected_sum {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "constmap: checksum mismatch (got {:016x}, expected {:016x})",
-                    got_sum, expected_sum
-                ),
-            ));
-        }
-
-        Ok(ConstMap {
-            seed,
-            segment_length,
-            segment_length_mask,
-            segment_count,
-            segment_count_length,
-            data,
-        })
-    }
-
-    /// Serialize the `ConstMap` to a file at the given path.
-    pub fn save_to_file(&self, path: &str) -> io::Result<()> {
-        let mut f = std::fs::File::create(path)?;
-        self.write_to(&mut f)?;
-        Ok(())
-    }
-
-    /// Deserialize a `ConstMap` from a file at the given path.
-    pub fn load_from_file(path: &str) -> io::Result<Self> {
-        let mut f = std::fs::File::open(path)?;
-        Self::read_from(&mut f)
+impl std::fmt::Debug for ConstMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConstMap")
+            .field("seed", &self.seed)
+            .field("segment_length", &self.segment_length)
+            .field("segment_count", &self.segment_count)
+            .field("data_len", &self.data.len())
+            .finish()
     }
 }
 
@@ -519,18 +394,18 @@ impl ConstMap {
 /// returned. This detects (with high probability) lookups of keys that were not in
 /// the original set, at the cost of doubling memory usage (~18 bytes/key instead of ~9).
 pub struct VerifiedConstMap {
-    seed: u64,
-    segment_length: u32,
-    segment_length_mask: u32,
-    segment_count: u32,
-    segment_count_length: u32,
-    data: Vec<u64>,
-    checks: Vec<u64>,
+    pub(crate) seed: u64,
+    pub(crate) segment_length: u32,
+    pub(crate) segment_length_mask: u32,
+    pub(crate) segment_count: u32,
+    pub(crate) segment_count_length: u32,
+    pub(crate) data: Vec<u64>,
+    pub(crate) checks: Vec<u64>,
 }
 
 impl VerifiedConstMap {
     #[inline]
-    fn get_hash_from_hash(&self, hash: u64) -> (u32, u32, u32) {
+    pub(crate) fn get_hash_from_hash(&self, hash: u64) -> (u32, u32, u32) {
         let hi = ((hash as u128 * self.segment_count_length as u128) >> 64) as u32;
         let h0 = hi;
         let mut h1 = h0.wrapping_add(self.segment_length);
@@ -827,6 +702,17 @@ impl VerifiedConstMap {
     }
 }
 
+impl std::fmt::Debug for VerifiedConstMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedConstMap")
+            .field("seed", &self.seed)
+            .field("segment_length", &self.segment_length)
+            .field("segment_count", &self.segment_count)
+            .field("data_len", &self.data.len())
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,94 +771,6 @@ mod tests {
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(cm.map(k), values[i], "Map({}) mismatch", k);
         }
-    }
-
-    #[test]
-    fn test_serialize_deserialize() {
-        let keys = vec!["apple", "banana", "cherry", "date", "elderberry"];
-        let values = vec![100u64, 200, 300, 400, 500];
-
-        let cm = ConstMap::new(&keys, &values).unwrap();
-
-        let mut buf = Vec::new();
-        cm.write_to(&mut buf).unwrap();
-
-        let cm2 = ConstMap::read_from(&mut &buf[..]).unwrap();
-
-        for (i, &k) in keys.iter().enumerate() {
-            assert_eq!(cm2.map(k), values[i], "after deserialize: Map({}) mismatch", k);
-        }
-    }
-
-    #[test]
-    fn test_serialize_large() {
-        let n = 100_000;
-        let keys: Vec<String> = (0..n).map(|i| format!("key-{}", i)).collect();
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-        let values: Vec<u64> = (0..n).map(|i| (i * 7) as u64).collect();
-
-        let cm = ConstMap::new(&key_refs, &values).unwrap();
-
-        let mut buf = Vec::new();
-        cm.write_to(&mut buf).unwrap();
-
-        let cm2 = ConstMap::read_from(&mut &buf[..]).unwrap();
-
-        for (i, k) in keys.iter().enumerate() {
-            assert_eq!(cm2.map(k), values[i], "after deserialize: Map({}) mismatch", k);
-        }
-    }
-
-    #[test]
-    fn test_serialize_corrupted() {
-        let keys = vec!["apple", "banana", "cherry"];
-        let values = vec![10u64, 20, 30];
-
-        let cm = ConstMap::new(&keys, &values).unwrap();
-
-        let mut buf = Vec::new();
-        cm.write_to(&mut buf).unwrap();
-
-        // Flip a byte in the middle.
-        let mid = buf.len() / 2;
-        buf[mid] ^= 0xff;
-
-        let result = ConstMap::read_from(&mut &buf[..]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_save_load_file() {
-        let keys = vec!["one", "two", "three"];
-        let values = vec![1u64, 2, 3];
-
-        let cm = ConstMap::new(&keys, &values).unwrap();
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.cmap");
-        let path_str = path.to_str().unwrap();
-
-        cm.save_to_file(path_str).unwrap();
-
-        let cm2 = ConstMap::load_from_file(path_str).unwrap();
-
-        for (i, &k) in keys.iter().enumerate() {
-            assert_eq!(cm2.map(k), values[i], "after load: Map({}) mismatch", k);
-        }
-
-        assert!(path.exists());
-        assert!(std::fs::metadata(&path).unwrap().len() > 0);
-    }
-
-    #[test]
-    fn test_serialize_empty() {
-        let cm = ConstMap::new(&[], &[]).unwrap();
-
-        let mut buf = Vec::new();
-        cm.write_to(&mut buf).unwrap();
-
-        let cm2 = ConstMap::read_from(&mut &buf[..]).unwrap();
-        assert!(cm2.data.is_empty());
     }
 
     #[test]

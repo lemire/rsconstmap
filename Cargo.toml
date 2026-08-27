@@ -1,9 +1,13 @@
 [package]
 name = "constmap"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "A static map from strings to u64 values using binary fuse filter construction"
+description = "A static map from strings to u64 values using binary fuse filter construction: smaller and faster than a HashMap, with batched lookups and checksummed serialization"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/lemire/rsconstmap"
+readme = "README.md"
+keywords = ["map", "perfect-hash", "binary-fuse", "static", "lookup"]
+categories = ["data-structures", "algorithms"]
 
 [dependencies]
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
