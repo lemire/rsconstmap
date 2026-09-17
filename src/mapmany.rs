@@ -3,7 +3,10 @@
 
 use xxhash_rust::xxh64::xxh64;
 
-use crate::{fingerprint, mixsplit, ConstMap, VerifiedConstMap, NOT_FOUND};
+use crate::{
+    fingerprint, mixsplit, xor3_slots, ConstMap, PairedVerifiedConstMap, VerifiedConstMap,
+    NOT_FOUND,
+};
 
 /// How many keys the batched lookups hash before gathering any values. Hashing
 /// a whole block first lets the array accesses of every key in the block be in
@@ -152,6 +155,72 @@ impl VerifiedConstMap {
     }
 }
 
+impl PairedVerifiedConstMap {
+    /// Look up every key in `keys` and return the values in a newly allocated
+    /// `Vec` of the same length, where `result[i]` corresponds to `keys[i]`.
+    /// Keys that were not in the original set yield [`NOT_FOUND`], exactly as
+    /// [`PairedVerifiedConstMap::map`] does.
+    ///
+    /// Each key's three slots are loaded and XORed as 128-bit vectors on
+    /// x86-64 and AArch64 (see [`PairedVerifiedConstMap`]).
+    pub fn map_many<K: AsRef<str>>(&self, keys: &[K]) -> Vec<u64> {
+        let mut dst = vec![0u64; keys.len()];
+        self.map_many_into(&mut dst, keys);
+        dst
+    }
+
+    /// [`PairedVerifiedConstMap::map_many`] writing into a caller-provided
+    /// slice, so that a repeated batch need not allocate. It fills
+    /// `dst[..keys.len()]` and leaves the rest of `dst` alone.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dst` is shorter than `keys`.
+    pub fn map_many_into<K: AsRef<str>>(&self, dst: &mut [u64], keys: &[K]) {
+        assert!(
+            dst.len() >= keys.len(),
+            "constmap: map_many_into destination is shorter than keys"
+        );
+        if self.slots.is_empty() {
+            dst[..keys.len()].fill(NOT_FOUND);
+            return;
+        }
+
+        let mut h0 = [0u32; BATCH_BLOCK];
+        let mut h1 = [0u32; BATCH_BLOCK];
+        let mut h2 = [0u32; BATCH_BLOCK];
+        let mut hashes = [0u64; BATCH_BLOCK];
+
+        let blocks = keys.len() / BATCH_BLOCK * BATCH_BLOCK;
+        let mut i = 0;
+        while i < blocks {
+            let block = &keys[i..i + BATCH_BLOCK];
+            for (j, key) in block.iter().enumerate() {
+                let hash = mixsplit(xxh64(key.as_ref().as_bytes(), 0), self.seed);
+                let (a, b, c) = self.get_hash_from_hash(hash);
+                hashes[j] = hash;
+                h0[j] = a;
+                h1[j] = b;
+                h2[j] = c;
+            }
+            let out = &mut dst[i..i + BATCH_BLOCK];
+            for j in 0..BATCH_BLOCK {
+                let [value, fp] = xor3_slots(&self.slots, h0[j], h1[j], h2[j]);
+                out[j] = if fp == fingerprint(hashes[j]) {
+                    value
+                } else {
+                    NOT_FOUND
+                };
+            }
+            i += BATCH_BLOCK;
+        }
+        // Tail: fewer than BATCH_BLOCK keys left.
+        for (slot, key) in dst[blocks..keys.len()].iter_mut().zip(&keys[blocks..]) {
+            *slot = self.map(key.as_ref());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,5 +353,58 @@ mod tests {
         let vm = VerifiedConstMap::new(&refs(&keys), &values).unwrap();
         let mut dst = [0u64; 3];
         vm.map_many_into(&mut dst, &keys[..4]);
+    }
+
+    #[test]
+    fn test_paired_map_many_matches_map() {
+        use rand::Rng;
+        let (keys, values) = build_data(20_000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut rng = rand::thread_rng();
+
+        for n in SIZES {
+            // Mix present and absent keys, so both outcomes of the
+            // fingerprint check are exercised inside a block and in the tail.
+            let batch: Vec<String> = (0..n)
+                .map(|_| {
+                    if rng.gen_bool(0.5) {
+                        keys[rng.gen_range(0..keys.len())].clone()
+                    } else {
+                        format!("absent-{}", rng.gen::<u64>())
+                    }
+                })
+                .collect();
+            let got = pm.map_many(&batch);
+            assert_eq!(got.len(), n);
+            for (i, k) in batch.iter().enumerate() {
+                assert_eq!(got[i], pm.map(k), "n={}: map_many({}) mismatch", n, k);
+            }
+        }
+    }
+
+    #[test]
+    fn test_paired_map_many_matches_verified() {
+        let (keys, values) = build_data(20_000);
+        let vm = VerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let pm = vm.paired();
+        let mut batch: Vec<String> = keys[..5000].to_vec();
+        batch.extend((0..5000).map(|i| format!("absent-{}", i)));
+        assert_eq!(pm.map_many(&batch), vm.map_many(&batch));
+    }
+
+    #[test]
+    fn test_paired_map_many_empty_map() {
+        let pm = PairedVerifiedConstMap::new(&[], &[]).unwrap();
+        let got = pm.map_many(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        assert_eq!(got, vec![NOT_FOUND; 9]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shorter than keys")]
+    fn test_paired_map_many_into_short_destination() {
+        let (keys, values) = build_data(100);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut dst = vec![0u64; 5];
+        pm.map_many_into(&mut dst, &keys[..10]);
     }
 }

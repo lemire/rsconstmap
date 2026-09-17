@@ -9,7 +9,12 @@ on:
 jobs:
   test:
     name: Test suite
-    runs-on: ubuntu-latest
+    # Both architectures, since the paired map has SSE2 and NEON code paths.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - name: Checkout

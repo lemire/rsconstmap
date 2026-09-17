@@ -50,6 +50,48 @@ assert_eq!(map.map("apple"), 100);
 assert_eq!(map.map("unknown"), NOT_FOUND);
 ```
 
+### Paired layout
+
+`VerifiedConstMap` keeps its values and its fingerprints in two separate arrays, so a
+lookup of a present key reads three fingerprint words and then three value words: six
+cache lines, in two different places. `PairedVerifiedConstMap` is the same map with each
+value stored next to its fingerprint, so the three reads bring in both at once and a
+lookup touches three cache lines instead of six:
+
+```rust
+use constmap::{PairedVerifiedConstMap, NOT_FOUND};
+
+let map = PairedVerifiedConstMap::new(&keys, &values).unwrap();
+assert_eq!(map.map("apple"), 100);
+assert_eq!(map.map("unknown"), NOT_FOUND);
+```
+
+It has exactly the semantics, memory footprint and API of `VerifiedConstMap` (`map`,
+`map_many`, `map_many_into`, `save_to_file`, `load_from_file`), and an existing
+`VerifiedConstMap` converts with `vm.paired()`. The difference is which keys it is
+fast for:
+
+- **Present keys**: fewer cache lines, so faster. Random lookups over a million keys
+  run 21% faster than `VerifiedConstMap::map` on an Apple M4 Max and 9% on an Intel
+  Xeon Gold 6548N (table under *Performance gains*).
+- **Absent keys**: slower. `VerifiedConstMap::map` stops after reading the fingerprint
+  array, which is half the size of the whole map and so far more likely to be
+  cache-resident, whereas the paired map always brings the value in alongside the
+  fingerprint, so its working set for misses is twice as large.
+- **Batches**: `map_many` overlaps the memory accesses of eight keys, which hides
+  some of the extra latency either way, but the paired layout still wins on present
+  keys: 18% faster cold on the M4 Max and 34% on the Xeon (table under *Batched
+  lookups*).
+
+Use `PairedVerifiedConstMap` when most of the keys you look up are present, and
+`VerifiedConstMap` when most are absent. Its serialized format has its own magic bytes
+(`PMAP0001`) and is not interchangeable with `VerifiedConstMap`'s.
+
+On x86-64 and AArch64, each 16-byte slot is loaded and the three slots XORed as
+128-bit vectors (SSE2 and NEON respectively, both part of their architecture's
+baseline, so there is no runtime feature detection). Other targets use plain scalar
+code.
+
 ## Batched lookups
 
 If you have many keys to resolve at once, `map_many` takes a slice of keys and returns
@@ -59,7 +101,8 @@ a `Vec` of values, where `result[i]` corresponds to `keys[i]`:
 let values = cm.map_many(&["apple", "banana", "cherry"]); // [100, 200, 300]
 ```
 
-`VerifiedConstMap` has the same method, and still reports absent keys as `NOT_FOUND`:
+`VerifiedConstMap` and `PairedVerifiedConstMap` have the same method, and still report
+absent keys as `NOT_FOUND`:
 
 ```rust
 let values = vm.map_many(&["banana", "grape"]); // [200, NOT_FOUND]
@@ -100,10 +143,14 @@ dominates instead.
 | | `ConstMap` hot | 4.8 | **3.6** | 25% |
 | | `VerifiedConstMap` cold | 11.4 | **8.3** | 27% |
 | | `VerifiedConstMap` hot | 7.1 | **5.2** | 27% |
+| | `PairedVerifiedConstMap` cold | 7.7 | **6.3** | 18% |
+| | `PairedVerifiedConstMap` hot | 5.2 | **3.9** | 25% |
 | **Xeon Gold 6548N** | `ConstMap` cold | 15.8 | **12.5** | 21% |
 | | `ConstMap` hot | 9.0 | **7.6** | 16% |
 | | `VerifiedConstMap` cold | 20.3 | 21.1 | none |
 | | `VerifiedConstMap` hot | 11.8 | **9.6** | 19% |
+| | `PairedVerifiedConstMap` cold | 18.4 | **14.1** | 23% |
+| | `PairedVerifiedConstMap` hot | 11.1 | **8.6** | 23% |
 
 The one place batching does not pay is `VerifiedConstMap` in the cold regime on the
 Xeon, where repeated runs put the difference at anywhere from 2% faster to 4% slower --
@@ -124,8 +171,8 @@ hoist.
 
 ## Serialization
 
-Both map types can be serialized to disk and loaded back later, avoiding the cost of
-reconstruction. Each binary format includes a FNV-1a checksum to detect corruption.
+All three map types can be serialized to disk and loaded back later, avoiding the cost
+of reconstruction. Each binary format includes a FNV-1a checksum to detect corruption.
 
 ```rust
 // Save to file.
@@ -134,9 +181,11 @@ cm.save_to_file("mymap.cmap")?;
 // Load from file.
 let cm = ConstMap::load_from_file("mymap.cmap")?;
 
-// Same for VerifiedConstMap, in its own format.
+// Same for VerifiedConstMap and PairedVerifiedConstMap, each in its own format.
 vm.save_to_file("myverifiedmap.vmap")?;
 let vm = VerifiedConstMap::load_from_file("myverifiedmap.vmap")?;
+pm.save_to_file("mypairedmap.pmap")?;
+let pm = PairedVerifiedConstMap::load_from_file("mypairedmap.pmap")?;
 ```
 
 For streaming use, `write_to` and `read_from` work with any `Write` / `Read`:
@@ -172,6 +221,38 @@ multiple of eight because the first array is a whole number of words. A reader t
 maps or otherwise aliases the file can treat either array as a `[u64]` without a
 misaligned access.
 
+### Interoperability with the Go and Python implementations
+
+The formats are shared with [constmap](https://github.com/lemire/constmap) (Go)
+and [fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python
+bindings): a map saved by any of the three loads in the other two, on a
+little-endian host (which is every mainstream one: x86-64, ARM64, RISC-V, Apple
+silicon). The three share the key hash (XXH64), the mixing, the seed sequence and
+the layout, so for the same input this crate and the Go package write
+byte-identical files, and fastconstmap writes the same bytes apart from one header
+word:
+
+- `VerifiedConstMap` (`VMAP0001`) and `PairedVerifiedConstMap` (`PMAP0001`) are
+  identical across the three. fastconstmap stores its key count in the header word
+  this crate leaves as zero padding; every reader ignores the word.
+- `ConstMap` files from fastconstmap carry the magic `CMAP0003`: this crate's
+  `CMAP0001` plus that 4-byte key count after the data length. `read_from` accepts
+  both and ignores the count.
+
+```rust
+let vm = VerifiedConstMap::load_from_file("built-by-python.vmap")?; // from VerifiedConstMap.save
+let cm = ConstMap::load_from_file("built-by-go.cmap")?;             // from ConstMap.SaveToFile
+```
+
+Files written by fastconstmap 0.9 and earlier (`CMAP0002`, `VCMP0002`) used a
+different key hash (XXH3) and cannot be loaded here; `read_from` says so rather
+than reporting an invalid file. fastconstmap 0.10 and later still read them, and a
+map rebuilt from its keys there writes the shared format.
+
+The interoperability is tested: `tests/interop/` holds files written by the other
+two implementations from a fixed input, which `tests/interop.rs` loads and checks,
+and it checks that this crate writes exactly the bytes the Go package wrote.
+
 ## Performance gains
 
 Construction time is higher (as expected for any compact data structure), but lookups
@@ -182,6 +263,7 @@ are optimized for speed. Against `std::collections::HashMap<String, u64>` with
 |---|---|---|
 | `ConstMap` | 7.0 ns | 18.8 ns |
 | `VerifiedConstMap` | 12.3 ns | 26.4 ns |
+| `PairedVerifiedConstMap` | 9.8 ns | 23.7 ns |
 | `HashMap` | 54.6 ns | 94.6 ns |
 
 The speed varies depending on your system, the size of your dataset, the keys, the
@@ -256,7 +338,7 @@ cargo bench
 
 Three groups:
 
-- **`lookup`** -- single-key throughput for `ConstMap`, `VerifiedConstMap` and `HashMap`
+- **`lookup`** -- single-key throughput for `ConstMap`, `VerifiedConstMap`, `PairedVerifiedConstMap` and `HashMap`
 - **`batch`** -- `map_many_into` against the loop over `map` it replaces, cold and hot,
   for both map types
 - **`serialize`** -- `save_to_file` / `load_from_file` for both map types

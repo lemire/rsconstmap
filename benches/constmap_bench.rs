@@ -17,7 +17,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 
-use constmap::{ConstMap, VerifiedConstMap};
+use constmap::{ConstMap, PairedVerifiedConstMap, VerifiedConstMap};
 
 const BENCH_N: usize = 1_000_000;
 
@@ -82,6 +82,7 @@ fn bench_lookup(
     values: &[u64],
     cm: &ConstMap,
     vm: &VerifiedConstMap,
+    pm: &PairedVerifiedConstMap,
 ) {
     let queries = make_query_order(keys, 1);
     let hm: HashMap<String, u64> = keys.iter().cloned().zip(values.iter().copied()).collect();
@@ -107,6 +108,15 @@ fn bench_lookup(
         });
     });
 
+    group.bench_function("PairedVerifiedConstMap", |b| {
+        let mut i = 0usize;
+        b.iter(|| {
+            let v = pm.map(black_box(&queries[i]));
+            i = (i + 1) % queries.len();
+            v
+        });
+    });
+
     group.bench_function("HashMap", |b| {
         let mut i = 0usize;
         b.iter(|| {
@@ -125,7 +135,13 @@ fn bench_lookup(
 /// memory latency. Hot replays one batch, so the touched region goes
 /// cache-resident and hashing dominates instead. Batching helps in both, but
 /// for different reasons, and a single regime would hide one of them.
-fn bench_batch(c: &mut Criterion, keys: &[String], cm: &ConstMap, vm: &VerifiedConstMap) {
+fn bench_batch(
+    c: &mut Criterion,
+    keys: &[String],
+    cm: &ConstMap,
+    vm: &VerifiedConstMap,
+    pm: &PairedVerifiedConstMap,
+) {
     let batches = make_query_batches(keys, 1, NUM_BATCH_POOLS);
     let hot = &batches[0];
     let mut out = vec![0u64; BATCH_SIZE];
@@ -209,6 +225,44 @@ fn bench_batch(c: &mut Criterion, keys: &[String], cm: &ConstMap, vm: &VerifiedC
         });
     });
 
+    group.bench_function("paired_naive_cold", |b| {
+        let mut p = 0usize;
+        b.iter(|| {
+            let q = &batches[p];
+            p = (p + 1) % NUM_BATCH_POOLS;
+            for (slot, k) in out.iter_mut().zip(q) {
+                *slot = pm.map(k);
+            }
+            black_box(out[0])
+        });
+    });
+
+    group.bench_function("paired_map_many_cold", |b| {
+        let mut p = 0usize;
+        b.iter(|| {
+            let q = &batches[p];
+            p = (p + 1) % NUM_BATCH_POOLS;
+            pm.map_many_into(&mut out, q);
+            black_box(out[0])
+        });
+    });
+
+    group.bench_function("paired_naive_hot", |b| {
+        b.iter(|| {
+            for (slot, k) in out.iter_mut().zip(hot) {
+                *slot = pm.map(k);
+            }
+            black_box(out[0])
+        });
+    });
+
+    group.bench_function("paired_map_many_hot", |b| {
+        b.iter(|| {
+            pm.map_many_into(&mut out, hot);
+            black_box(out[0])
+        });
+    });
+
     group.finish();
 }
 
@@ -246,9 +300,10 @@ fn benches(c: &mut Criterion) {
     let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
     let cm = ConstMap::new(&key_refs, &values).unwrap();
     let vm = VerifiedConstMap::new(&key_refs, &values).unwrap();
+    let pm = vm.paired();
 
-    bench_lookup(c, &keys, &values, &cm, &vm);
-    bench_batch(c, &keys, &cm, &vm);
+    bench_lookup(c, &keys, &values, &cm, &vm, &pm);
+    bench_batch(c, &keys, &cm, &vm, &pm);
     bench_serialize(c, &cm, &vm);
 }
 

@@ -6,14 +6,18 @@
 //! Lookup is extremely fast: one xxhash call plus three array accesses and two XORs.
 //! The data structure is immutable after construction.
 //!
-//! Two map types are provided: [`ConstMap`], which returns an undefined value for a
-//! key that was not in the original set, and [`VerifiedConstMap`], which stores a
-//! fingerprint per key and returns [`NOT_FOUND`] instead, for twice the memory.
+//! Three map types are provided: [`ConstMap`], which returns an undefined value for a
+//! key that was not in the original set; [`VerifiedConstMap`], which stores a
+//! fingerprint per key and returns [`NOT_FOUND`] instead, for twice the memory; and
+//! [`PairedVerifiedConstMap`], the same map with each value stored next to its
+//! fingerprint, which touches fewer cache lines when the key is present.
 //!
-//! Both support batched lookups (`map_many` / `map_many_into`), which overlap the
-//! memory accesses of several keys and are faster than a loop over `map`, and both
+//! All support batched lookups (`map_many` / `map_many_into`), which overlap the
+//! memory accesses of several keys and are faster than a loop over `map`, and all
 //! serialize to a checksummed binary format (`write_to` / `read_from`,
-//! `save_to_file` / `load_from_file`).
+//! `save_to_file` / `load_from_file`) shared with the Go (constmap) and C/Python
+//! (fastconstmap) implementations: a map saved by any of the three loads in the
+//! other two, on a little-endian host.
 
 use std::collections::HashMap;
 
@@ -702,6 +706,163 @@ impl VerifiedConstMap {
     }
 }
 
+// ---------- PairedVerifiedConstMap ----------
+
+/// One position of a [`PairedVerifiedConstMap`]: the value word and its
+/// fingerprint word, side by side so that a lookup reads both from one cache
+/// line, and so that the compiler can load and XOR them as one 128-bit vector.
+pub(crate) type Slot = [u64; 2];
+
+/// A [`VerifiedConstMap`] with a different memory layout.
+///
+/// Where `VerifiedConstMap` keeps its values and its fingerprints in two
+/// separate arrays, this map stores each value next to its fingerprint, so the
+/// three positions a lookup reads each yield both words from one cache line:
+/// three lines touched instead of six.
+///
+/// Whether that is a win depends on what you look up. On a present key, `map`
+/// is faster than [`VerifiedConstMap::map`]: about 20% on an Intel Xeon Gold
+/// 6548N once the map outgrows the cache. On an absent key it is slower:
+/// `VerifiedConstMap::map` reads only the fingerprint array, which is half the
+/// size of the whole map and so far more likely to be resident in cache,
+/// whereas this map always brings the value in alongside the fingerprint.
+///
+/// Semantics and size are exactly those of `VerifiedConstMap`: the same keys
+/// and values produce the same seed and the same words, just zipped together.
+/// The serialized format is its own, and is not interchangeable with
+/// `VerifiedConstMap`'s.
+pub struct PairedVerifiedConstMap {
+    pub(crate) seed: u64,
+    pub(crate) segment_length: u32,
+    pub(crate) segment_length_mask: u32,
+    pub(crate) segment_count: u32,
+    pub(crate) segment_count_length: u32,
+    /// `slots[i][0]` is the value word for position `i`, `slots[i][1]` its
+    /// fingerprint word.
+    pub(crate) slots: Vec<Slot>,
+}
+
+/// XOR of the three slots at `h0`, `h1`, `h2`: the value in `[0]`, the
+/// fingerprint in `[1]`.
+///
+/// The indexing is bounds-checked here; `xor3` then reads each slot as one
+/// 128-bit vector on x86-64 (SSE2) and AArch64 (NEON), both of which are part
+/// of their architecture's baseline, so no runtime feature detection is
+/// needed. Other targets use the plain scalar version.
+#[inline(always)]
+pub(crate) fn xor3_slots(slots: &[Slot], h0: u32, h1: u32, h2: u32) -> Slot {
+    xor3(
+        &slots[h0 as usize],
+        &slots[h1 as usize],
+        &slots[h2 as usize],
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn xor3(a: &Slot, b: &Slot, c: &Slot) -> Slot {
+    use std::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
+    // SAFETY: SSE2 is always available on x86-64. Each reference is to a
+    // live 16-byte slot, which is all an unaligned 128-bit load reads.
+    unsafe {
+        let v = _mm_loadu_si128(a.as_ptr() as *const __m128i);
+        let v = _mm_xor_si128(v, _mm_loadu_si128(b.as_ptr() as *const __m128i));
+        let v = _mm_xor_si128(v, _mm_loadu_si128(c.as_ptr() as *const __m128i));
+        let mut out: Slot = [0; 2];
+        _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, v);
+        out
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn xor3(a: &Slot, b: &Slot, c: &Slot) -> Slot {
+    use std::arch::aarch64::{veorq_u64, vgetq_lane_u64, vld1q_u64};
+    // SAFETY: NEON is always available on AArch64. Each reference is to a
+    // live 16-byte slot, which is all `vld1q_u64` reads.
+    unsafe {
+        let v = vld1q_u64(a.as_ptr());
+        let v = veorq_u64(v, vld1q_u64(b.as_ptr()));
+        let v = veorq_u64(v, vld1q_u64(c.as_ptr()));
+        [vgetq_lane_u64(v, 0), vgetq_lane_u64(v, 1)]
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(always)]
+fn xor3(a: &Slot, b: &Slot, c: &Slot) -> Slot {
+    [a[0] ^ b[0] ^ c[0], a[1] ^ b[1] ^ c[1]]
+}
+
+impl PairedVerifiedConstMap {
+    #[inline]
+    pub(crate) fn get_hash_from_hash(&self, hash: u64) -> (u32, u32, u32) {
+        let hi = ((hash as u128 * self.segment_count_length as u128) >> 64) as u32;
+        let h0 = hi;
+        let mut h1 = h0.wrapping_add(self.segment_length);
+        let mut h2 = h1.wrapping_add(self.segment_length);
+        h1 ^= (hash >> 18) as u32 & self.segment_length_mask;
+        h2 ^= hash as u32 & self.segment_length_mask;
+        (h0, h1, h2)
+    }
+
+    /// Build a `PairedVerifiedConstMap` from a set of string keys and their
+    /// associated `u64` values, under the same rules as
+    /// [`VerifiedConstMap::new`].
+    pub fn new(keys: &[&str], values: &[u64]) -> Result<Self, String> {
+        Ok(VerifiedConstMap::new(keys, values)?.paired())
+    }
+
+    /// Return the `u64` value associated with the given key, or [`NOT_FOUND`]
+    /// if the key was not in the original set, exactly as
+    /// [`VerifiedConstMap::map`] does.
+    #[inline]
+    pub fn map(&self, key: &str) -> u64 {
+        if self.slots.is_empty() {
+            return NOT_FOUND;
+        }
+        let hash = mixsplit(xxh64(key.as_bytes(), 0), self.seed);
+        let (h0, h1, h2) = self.get_hash_from_hash(hash);
+        let [value, fp] = xor3_slots(&self.slots, h0, h1, h2);
+        if fp == fingerprint(hash) {
+            value
+        } else {
+            NOT_FOUND
+        }
+    }
+}
+
+impl VerifiedConstMap {
+    /// The same map in the paired layout. The result is a copy; the two maps
+    /// share no memory.
+    pub fn paired(&self) -> PairedVerifiedConstMap {
+        PairedVerifiedConstMap {
+            seed: self.seed,
+            segment_length: self.segment_length,
+            segment_length_mask: self.segment_length_mask,
+            segment_count: self.segment_count,
+            segment_count_length: self.segment_count_length,
+            slots: self
+                .data
+                .iter()
+                .zip(&self.checks)
+                .map(|(&value, &check)| [value, check])
+                .collect(),
+        }
+    }
+}
+
+impl std::fmt::Debug for PairedVerifiedConstMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairedVerifiedConstMap")
+            .field("seed", &self.seed)
+            .field("segment_length", &self.segment_length)
+            .field("segment_count", &self.segment_count)
+            .field("slots_len", &self.slots.len())
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for VerifiedConstMap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifiedConstMap")
@@ -821,5 +982,54 @@ mod tests {
     fn test_verified_empty() {
         let vm = VerifiedConstMap::new(&[], &[]).unwrap();
         assert_eq!(vm.map("anything"), NOT_FOUND);
+    }
+
+    #[test]
+    fn test_paired_basic() {
+        let keys = vec!["apple", "banana", "cherry", "date", "elderberry"];
+        let values = vec![100u64, 200, 300, 400, 500];
+
+        let pm = PairedVerifiedConstMap::new(&keys, &values).unwrap();
+
+        for (i, &k) in keys.iter().enumerate() {
+            assert_eq!(pm.map(k), values[i], "Map({}) mismatch", k);
+        }
+        for k in ["grape", "kiwi", "mango", "pear", "plum"] {
+            assert_eq!(pm.map(k), NOT_FOUND, "Map({}) should be NOT_FOUND", k);
+        }
+    }
+
+    #[test]
+    fn test_paired_empty() {
+        let pm = PairedVerifiedConstMap::new(&[], &[]).unwrap();
+        assert_eq!(pm.map("anything"), NOT_FOUND);
+    }
+
+    /// The defining property of the paired map: it is the verified map's two
+    /// arrays zipped together, so the two agree on every key, present or
+    /// absent, and use the same number of words.
+    #[test]
+    fn test_paired_matches_verified() {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let n = 100_000;
+        let keys: Vec<String> = (0..n).map(|i| format!("key-{}", i)).collect();
+        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let values: Vec<u64> = (0..n).map(|_| rng.gen()).collect();
+
+        let vm = VerifiedConstMap::new(&key_refs, &values).unwrap();
+        let pm = vm.paired();
+
+        assert_eq!(pm.slots.len(), vm.data.len());
+        for (i, slot) in pm.slots.iter().enumerate() {
+            assert_eq!(*slot, [vm.data[i], vm.checks[i]], "slot {} mismatch", i);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(pm.map(k), values[i], "Map({}) mismatch", k);
+        }
+        for i in 0..20_000 {
+            let k = format!("absent-{}", i);
+            assert_eq!(pm.map(&k), vm.map(&k), "Map({}) disagrees", k);
+        }
     }
 }

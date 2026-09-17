@@ -7,7 +7,7 @@
 
 use std::io::{self, Read, Write};
 
-use crate::{ConstMap, VerifiedConstMap};
+use crate::{ConstMap, PairedVerifiedConstMap, VerifiedConstMap};
 
 // ---------- FNV-1a 64-bit ----------
 
@@ -153,8 +153,34 @@ fn checksum_mismatch(got: u64, expected: u64) -> io::Error {
 //   [4] data.len()
 //   [8*data.len()] data
 //   [8] FNV-1a 64-bit checksum of all preceding bytes
+//
+// The formats of this crate are shared with constmap (Go) and fastconstmap
+// (C/Python): a file written by any of the three loads in the other two, on a
+// little-endian host. fastconstmap writes its ConstMaps with magic "CMAP0003",
+// which is this format with a fourth 4-byte header field holding the original
+// key count (so that its len() survives a save and load); read_from accepts
+// it and ignores the count. It also recognises the "CMAP0002" files
+// fastconstmap 0.9 and earlier wrote, which hashed keys with XXH3 rather than
+// XXH64 and so cannot be used here, and names them so the user knows to
+// rebuild the map with a current fastconstmap.
 
 const MAGIC: &[u8; 8] = b"CMAP0001";
+
+/// fastconstmap's ConstMap magic: CMAP0001 plus a key count field after the
+/// data length.
+const MAGIC_COUNTED: &[u8; 8] = b"CMAP0003";
+
+/// Magics of files written by fastconstmap 0.9 and earlier, which used a
+/// different key hash. They cannot be loaded, only recognised.
+const LEGACY_FAST_MAGIC: &[u8; 8] = b"CMAP0002";
+const LEGACY_FAST_VERIFIED_MAGIC: &[u8; 8] = b"VCMP0002";
+
+fn legacy_fastconstmap() -> io::Error {
+    invalid_data(
+        "constmap: this file was written by fastconstmap 0.9 or earlier with a different key hash; \
+         rebuild it from its keys with fastconstmap 0.10 or later, which writes the shared format",
+    )
+}
 
 impl ConstMap {
     /// Serialize the `ConstMap` to a writer in a portable binary format.
@@ -196,11 +222,20 @@ impl ConstMap {
             let mut hr = HashReader::new(r);
 
             hr.read_exact(&mut buf8)?;
-            if &buf8 != MAGIC {
+            let counted = &buf8 == MAGIC_COUNTED;
+            if &buf8 != MAGIC && !counted {
                 if &buf8 == VERIFIED_MAGIC {
                     return Err(invalid_data(
                         "constmap: this is a VerifiedConstMap file, use VerifiedConstMap::load_from_file",
                     ));
+                }
+                if &buf8 == PAIRED_MAGIC {
+                    return Err(invalid_data(
+                        "constmap: this is a PairedVerifiedConstMap file, use PairedVerifiedConstMap::load_from_file",
+                    ));
+                }
+                if &buf8 == LEGACY_FAST_MAGIC || &buf8 == LEGACY_FAST_VERIFIED_MAGIC {
+                    return Err(legacy_fastconstmap());
                 }
                 return Err(invalid_data("constmap: invalid magic bytes"));
             }
@@ -216,6 +251,11 @@ impl ConstMap {
 
             hr.read_exact(&mut buf4)?;
             let data_len = u32::from_le_bytes(buf4) as usize;
+
+            // Key count, present only in fastconstmap's CMAP0003; not kept.
+            if counted {
+                hr.read_exact(&mut buf4)?;
+            }
 
             // Data, read a chunk at a time and decoded in place.
             let mut data = vec![0u64; data_len];
@@ -265,7 +305,8 @@ impl ConstMap {
 //   [4] segment_length
 //   [4] segment_count
 //   [4] data.len(), which is also checks.len()
-//   [4] zero padding
+//   [4] zero padding; fastconstmap stores its original key count here, and
+//       every reader ignores the field
 //   [8*data.len()] data
 //   [8*data.len()] checks
 //   [8] FNV-1a 64-bit checksum of all preceding bytes
@@ -340,6 +381,14 @@ impl VerifiedConstMap {
                         "constmap: this is a ConstMap file, use ConstMap::load_from_file",
                     ));
                 }
+                if &buf8 == PAIRED_MAGIC {
+                    return Err(invalid_data(
+                        "constmap: this is a PairedVerifiedConstMap file, use PairedVerifiedConstMap::load_from_file",
+                    ));
+                }
+                if &buf8 == LEGACY_FAST_MAGIC || &buf8 == LEGACY_FAST_VERIFIED_MAGIC {
+                    return Err(legacy_fastconstmap());
+                }
                 return Err(invalid_data("constmap: invalid magic bytes"));
             }
 
@@ -396,6 +445,170 @@ impl VerifiedConstMap {
     }
 
     /// Deserialize a `VerifiedConstMap` from a file at the given path.
+    pub fn load_from_file(path: &str) -> io::Result<Self> {
+        let mut f = std::fs::File::open(path)?;
+        Self::read_from(&mut f)
+    }
+}
+
+// ---------- PairedVerifiedConstMap ----------
+
+// Binary format for PairedVerifiedConstMap (all little-endian):
+//   [8] magic "PMAP0001"
+//   [8] seed
+//   [4] segment_length
+//   [4] segment_count
+//   [4] slots.len()
+//   [4] zero padding; fastconstmap stores its original key count here, and
+//       every reader ignores the field
+//   [16*slots.len()] slots, each a value word followed by its fingerprint word
+//   [8] FNV-1a 64-bit checksum of all preceding bytes
+//
+// This is the VerifiedConstMap format with its two arrays zipped together,
+// under its own magic so that a file of either kind fed to the other's reader
+// is reported rather than silently misinterpreted. The padding keeps the slot
+// array on a 64-bit boundary, as in the other two formats.
+
+const PAIRED_MAGIC: &[u8; 8] = b"PMAP0001";
+
+impl PairedVerifiedConstMap {
+    /// Serialize the `PairedVerifiedConstMap` to a writer in a portable binary
+    /// format.
+    ///
+    /// A FNV-1a checksum is appended for integrity verification. Returns the
+    /// number of bytes written.
+    pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<u64> {
+        let sum = {
+            let mut hw = HashWriter::new(w);
+
+            hw.write_all(PAIRED_MAGIC)?;
+            hw.write_all(&self.seed.to_le_bytes())?;
+            hw.write_all(&self.segment_length.to_le_bytes())?;
+            hw.write_all(&self.segment_count.to_le_bytes())?;
+            hw.write_all(&(self.slots.len() as u32).to_le_bytes())?;
+            // Padding, so that the slot array begins on a 64-bit boundary.
+            hw.write_all(&0u32.to_le_bytes())?;
+
+            // The slot array is already in file order: value, fingerprint,
+            // value, ...
+            let words = self.slots.as_flattened();
+            write_words(&mut hw, words, &mut chunk_buffer(words.len()))?;
+
+            hw.hasher.finish()
+        };
+
+        // Checksum (written to w only, not fed back into the hash).
+        w.write_all(&sum.to_le_bytes())?;
+
+        Ok(VERIFIED_HEADER_SIZE + 16 * self.slots.len() as u64 + 8)
+    }
+
+    /// Deserialize a `PairedVerifiedConstMap` from a reader.
+    ///
+    /// Verifies the trailing checksum and returns an error if the data is
+    /// corrupted.
+    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+        let mut buf8 = [0u8; 8];
+        let mut buf4 = [0u8; 4];
+
+        let (pm, expected_sum) = {
+            let mut hr = HashReader::new(r);
+
+            hr.read_exact(&mut buf8)?;
+            if &buf8 != PAIRED_MAGIC {
+                if &buf8 == MAGIC {
+                    return Err(invalid_data(
+                        "constmap: this is a ConstMap file, use ConstMap::load_from_file",
+                    ));
+                }
+                if &buf8 == VERIFIED_MAGIC {
+                    return Err(invalid_data(
+                        "constmap: this is a VerifiedConstMap file, use VerifiedConstMap::load_from_file",
+                    ));
+                }
+                if &buf8 == LEGACY_FAST_MAGIC || &buf8 == LEGACY_FAST_VERIFIED_MAGIC {
+                    return Err(legacy_fastconstmap());
+                }
+                return Err(invalid_data("constmap: invalid magic bytes"));
+            }
+
+            hr.read_exact(&mut buf8)?;
+            let seed = u64::from_le_bytes(buf8);
+
+            hr.read_exact(&mut buf4)?;
+            let segment_length = u32::from_le_bytes(buf4);
+
+            hr.read_exact(&mut buf4)?;
+            let segment_count = u32::from_le_bytes(buf4);
+
+            hr.read_exact(&mut buf4)?;
+            let slot_count = u32::from_le_bytes(buf4) as usize;
+
+            // Padding.
+            hr.read_exact(&mut buf4)?;
+
+            // The parameters must describe exactly this many slots, so that
+            // every position a lookup derives from them is in range: h0 is
+            // below segment_count * segment_length, and h1 and h2 each one
+            // segment further, so h2 < (segment_count + 2) * segment_length.
+            // That needs segment_length to be a power of two (h1 and h2 are
+            // formed by XORing bits below it) and segment_count to be at
+            // least one (with zero, h0 is always 0 and h2 lands in a third
+            // segment that does not exist). The checksum below catches
+            // accidental corruption; this catches a file that is consistent
+            // but not ours.
+            if slot_count != 0 {
+                if segment_length == 0 || !segment_length.is_power_of_two() {
+                    return Err(invalid_data(format!(
+                        "constmap: segment length {} is not a power of two",
+                        segment_length
+                    )));
+                }
+                if segment_count == 0 {
+                    return Err(invalid_data("constmap: segment count is zero"));
+                }
+                let want = (segment_count as u64 + 2) * segment_length as u64;
+                if want != slot_count as u64 {
+                    return Err(invalid_data(format!(
+                        "constmap: {} slots but the segment parameters describe {}",
+                        slot_count, want
+                    )));
+                }
+            }
+
+            let mut slots = vec![[0u64; 2]; slot_count];
+            let words = slots.as_flattened_mut();
+            read_words(&mut hr, words, &mut chunk_buffer(words.len()), "slots")?;
+
+            let pm = PairedVerifiedConstMap {
+                seed,
+                segment_length,
+                segment_length_mask: segment_length.wrapping_sub(1),
+                segment_count,
+                segment_count_length: segment_count.wrapping_mul(segment_length),
+                slots,
+            };
+            (pm, hr.hasher.finish())
+        };
+
+        // Checksum: read from r directly, not through the hashing reader.
+        r.read_exact(&mut buf8)?;
+        let got_sum = u64::from_le_bytes(buf8);
+        if got_sum != expected_sum {
+            return Err(checksum_mismatch(got_sum, expected_sum));
+        }
+
+        Ok(pm)
+    }
+
+    /// Serialize the `PairedVerifiedConstMap` to a file at the given path.
+    pub fn save_to_file(&self, path: &str) -> io::Result<()> {
+        let mut f = std::fs::File::create(path)?;
+        self.write_to(&mut f)?;
+        Ok(())
+    }
+
+    /// Deserialize a `PairedVerifiedConstMap` from a file at the given path.
     pub fn load_from_file(path: &str) -> io::Result<Self> {
         let mut f = std::fs::File::open(path)?;
         Self::read_from(&mut f)
@@ -779,6 +992,232 @@ mod tests {
         let err = ConstMap::read_from(&mut &b"NOTAMAP!12345678"[..]).unwrap_err();
         assert!(
             err.to_string().contains("invalid magic"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    // ---------- PairedVerifiedConstMap ----------
+
+    #[test]
+    fn test_paired_round_trip_lookups() {
+        let (keys, values) = build_data(50_000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+
+        let mut buf = Vec::new();
+        let written = pm.write_to(&mut buf).unwrap();
+        assert_eq!(written as usize, buf.len());
+
+        let pm2 = PairedVerifiedConstMap::read_from(&mut &buf[..]).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                pm2.map(k),
+                values[i],
+                "after deserialize: map({}) mismatch",
+                k
+            );
+        }
+        for i in 0..10_000 {
+            let k = format!("absent-{}", i);
+            assert_eq!(
+                pm2.map(&k),
+                NOT_FOUND,
+                "after deserialize: map({}) should be NOT_FOUND",
+                k
+            );
+        }
+    }
+
+    #[test]
+    fn test_paired_round_trip_file() {
+        let (keys, values) = build_data(1000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paired.cmap");
+        let path = path.to_str().unwrap();
+        pm.save_to_file(path).unwrap();
+        let pm2 = PairedVerifiedConstMap::load_from_file(path).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(pm2.map(k), values[i]);
+        }
+        assert_eq!(pm2.map("not-there"), NOT_FOUND);
+    }
+
+    #[test]
+    fn test_paired_serialize_empty() {
+        let pm = PairedVerifiedConstMap::new(&[], &[]).unwrap();
+        let mut buf = Vec::new();
+        pm.write_to(&mut buf).unwrap();
+        let pm2 = PairedVerifiedConstMap::read_from(&mut &buf[..]).unwrap();
+        assert!(pm2.slots.is_empty());
+        assert_eq!(pm2.map("anything"), NOT_FOUND);
+    }
+
+    /// The paired file is the verified file's size: same header, same number
+    /// of words, same trailer.
+    #[test]
+    fn test_paired_serialize_same_size_as_verified() {
+        let (keys, values) = build_data(1000);
+        let vm = VerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut vbuf = Vec::new();
+        let vn = vm.write_to(&mut vbuf).unwrap();
+        let mut pbuf = Vec::new();
+        let pn = vm.paired().write_to(&mut pbuf).unwrap();
+        assert_eq!(vn, pn);
+        assert_eq!(vbuf.len(), pbuf.len());
+    }
+
+    #[test]
+    fn test_paired_serialize_corrupted() {
+        let (keys, values) = build_data(1000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut buf = Vec::new();
+        pm.write_to(&mut buf).unwrap();
+
+        // Flip a value byte, a fingerprint byte, and a byte of the checksum
+        // itself; all three must be reported as checksum mismatches.
+        let n = buf.len();
+        for at in [
+            VERIFIED_HEADER_SIZE as usize + 40,
+            VERIFIED_HEADER_SIZE as usize + 48,
+            n - 3,
+        ] {
+            let mut corrupt = buf.clone();
+            corrupt[at] ^= 0xff;
+            let err = PairedVerifiedConstMap::read_from(&mut &corrupt[..]).unwrap_err();
+            assert!(
+                err.to_string().contains("checksum"),
+                "flipping byte {}: unexpected error: {}",
+                at,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_paired_serialize_truncated() {
+        let (keys, values) = build_data(1000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut buf = Vec::new();
+        pm.write_to(&mut buf).unwrap();
+        for len in [0, 8, 31, 32, 100, buf.len() - 1] {
+            assert!(
+                PairedVerifiedConstMap::read_from(&mut &buf[..len]).is_err(),
+                "truncating to {} bytes was not caught",
+                len
+            );
+        }
+    }
+
+    /// A file whose segment parameters do not describe its slot count is
+    /// refused even when its checksum is valid.
+    #[test]
+    fn test_paired_read_rejects_inconsistent_parameters() {
+        let (keys, values) = build_data(1000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let mut buf = Vec::new();
+        pm.write_to(&mut buf).unwrap();
+
+        fn rewrite_checksum(raw: &mut [u8]) {
+            let n = raw.len() - 8;
+            let mut h = Fnv64a::new();
+            h.write(&raw[..n]);
+            raw[n..].copy_from_slice(&h.finish().to_le_bytes());
+        }
+
+        // Double the segment count.
+        let mut bad = buf.clone();
+        let segment_count = u32::from_le_bytes(bad[20..24].try_into().unwrap());
+        bad[20..24].copy_from_slice(&(2 * segment_count).to_le_bytes());
+        rewrite_checksum(&mut bad);
+        let err = PairedVerifiedConstMap::read_from(&mut &bad[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("segment parameters"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A segment length that is not a power of two.
+        let mut bad = buf.clone();
+        bad[16..20].copy_from_slice(&3u32.to_le_bytes());
+        rewrite_checksum(&mut bad);
+        let err = PairedVerifiedConstMap::read_from(&mut &bad[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("power of two"),
+            "unexpected error: {}",
+            err
+        );
+
+        // A crafted file that passes the other two checks with a zero
+        // segment count: segment_length 4, segment_count 0, 8 slots, so
+        // (0 + 2) * 4 == 8. With it, h0 is always 0 and h2 lands in [8, 12),
+        // past the slots.
+        let mut crafted = Vec::new();
+        crafted.extend_from_slice(PAIRED_MAGIC);
+        crafted.extend_from_slice(&0u64.to_le_bytes()); // seed
+        crafted.extend_from_slice(&4u32.to_le_bytes()); // segment_length
+        crafted.extend_from_slice(&0u32.to_le_bytes()); // segment_count
+        crafted.extend_from_slice(&8u32.to_le_bytes()); // slots
+        crafted.extend_from_slice(&0u32.to_le_bytes()); // padding
+        crafted.extend_from_slice(&[0u8; 8 * 16]);
+        crafted.extend_from_slice(&[0u8; 8]); // checksum, rewritten below
+        rewrite_checksum(&mut crafted);
+        let err = PairedVerifiedConstMap::read_from(&mut &crafted[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("segment count"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_paired_write_to_short_writer() {
+        let (keys, values) = build_data(1000);
+        let pm = PairedVerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        for left in [0, 8, 32, 100] {
+            assert!(pm.write_to(&mut ShortWriter { left }).is_err());
+        }
+    }
+
+    /// The paired reader refuses the other two formats, and the other two
+    /// readers refuse a paired file.
+    #[test]
+    fn test_paired_format_is_distinct() {
+        let (keys, values) = build_data(100);
+        let cm = ConstMap::new(&refs(&keys), &values).unwrap();
+        let vm = VerifiedConstMap::new(&refs(&keys), &values).unwrap();
+        let pm = vm.paired();
+
+        let mut cbuf = Vec::new();
+        cm.write_to(&mut cbuf).unwrap();
+        let mut vbuf = Vec::new();
+        vm.write_to(&mut vbuf).unwrap();
+        let mut pbuf = Vec::new();
+        pm.write_to(&mut pbuf).unwrap();
+        assert_eq!(&pbuf[..8], PAIRED_MAGIC);
+
+        let err = PairedVerifiedConstMap::read_from(&mut &cbuf[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("ConstMap file"),
+            "unexpected error: {}",
+            err
+        );
+        let err = PairedVerifiedConstMap::read_from(&mut &vbuf[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("VerifiedConstMap file"),
+            "unexpected error: {}",
+            err
+        );
+        let err = ConstMap::read_from(&mut &pbuf[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("PairedVerifiedConstMap file"),
+            "unexpected error: {}",
+            err
+        );
+        let err = VerifiedConstMap::read_from(&mut &pbuf[..]).unwrap_err();
+        assert!(
+            err.to_string().contains("PairedVerifiedConstMap file"),
             "unexpected error: {}",
             err
         );
