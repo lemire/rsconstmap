@@ -249,6 +249,12 @@ different key hash (XXH3) and cannot be loaded here; `read_from` says so rather
 than reporting an invalid file. fastconstmap 0.10 and later still read them, and a
 map rebuilt from its keys there writes the shared format.
 
+There is also a Java implementation, in [jbinfuse](https://github.com/FastFilter/jbinfuse)
+(`me.lemire.fastfilter:jbinfuse` on Maven Central, version 0.1.0 or later). It shares
+the same formats: for the same input it writes exactly the bytes this crate and the Go
+package write, it reads fastconstmap's `CMAP0003`, and it can also query a saved map in
+place, from a memory-mapped file for example, without copying it.
+
 The interoperability is tested: `tests/interop/` holds files written by the other
 two implementations from a fixed input, which `tests/interop.rs` loads and checks,
 and it checks that this crate writes exactly the bytes the Go package wrote.
