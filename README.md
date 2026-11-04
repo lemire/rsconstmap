@@ -221,19 +221,19 @@ multiple of eight because the first array is a whole number of words. A reader t
 maps or otherwise aliases the file can treat either array as a `[u64]` without a
 misaligned access.
 
-### Interoperability with the Go and Python implementations
+### Interoperability with the Go, Python and Java implementations
 
-The formats are shared with [constmap](https://github.com/lemire/constmap) (Go)
-and [fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python
-bindings): a map saved by any of the three loads in the other two, on a
-little-endian host (which is every mainstream one: x86-64, ARM64, RISC-V, Apple
-silicon). The three share the key hash (XXH64), the mixing, the seed sequence and
-the layout, so for the same input this crate and the Go package write
-byte-identical files, and fastconstmap writes the same bytes apart from one header
-word:
+The formats are shared with [constmap](https://github.com/lemire/constmap) (Go),
+[fastconstmap](https://github.com/lemire/fastconstmap) (C, with Python bindings) and
+[jbinfuse](https://github.com/FastFilter/jbinfuse) (Java): a map saved by any of the four loads in the other
+three, on a little-endian host (which is every mainstream one: x86-64, ARM64,
+RISC-V, Apple silicon). The four share the key hash (XXH64), the mixing, the seed
+sequence and the layout, so for the same input this crate, the Go package and
+jbinfuse write byte-identical files, and fastconstmap writes the same bytes apart
+from one header word:
 
 - `VerifiedConstMap` (`VMAP0001`) and `PairedVerifiedConstMap` (`PMAP0001`) are
-  identical across the three. fastconstmap stores its key count in the header word
+  identical across the four. fastconstmap stores its key count in the header word
   this crate leaves as zero padding; every reader ignores the word.
 - `ConstMap` files from fastconstmap carry the magic `CMAP0003`: this crate's
   `CMAP0001` plus that 4-byte key count after the data length. `read_from` accepts
@@ -249,15 +249,15 @@ different key hash (XXH3) and cannot be loaded here; `read_from` says so rather
 than reporting an invalid file. fastconstmap 0.10 and later still read them, and a
 map rebuilt from its keys there writes the shared format.
 
-There is also a Java implementation, in [jbinfuse](https://github.com/FastFilter/jbinfuse)
-(`me.lemire.fastfilter:jbinfuse` on Maven Central, version 0.1.0 or later). It shares
-the same formats: for the same input it writes exactly the bytes this crate and the Go
-package write, it reads fastconstmap's `CMAP0003`, and it can also query a saved map in
-place, from a memory-mapped file for example, without copying it.
+jbinfuse (`me.lemire.fastfilter:jbinfuse` on Maven Central, from version 0.1.0) can
+also query a saved map in place, from a memory-mapped file for example, without
+copying it, whichever implementation wrote it.
 
-The interoperability is tested: `tests/interop/` holds files written by the other
-two implementations from a fixed input, which `tests/interop.rs` loads and checks,
-and it checks that this crate writes exactly the bytes the Go package wrote.
+The interoperability is tested: `tests/interop/` holds files written by the Go
+package and fastconstmap from a fixed input, which `tests/interop.rs` loads and
+checks, and it checks that this crate writes exactly the bytes the Go package wrote.
+jbinfuse tests itself against the same files, written by this crate and
+fastconstmap, and against the Go package.
 
 ## Performance gains
 
